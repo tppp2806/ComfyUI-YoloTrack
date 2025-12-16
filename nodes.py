@@ -1,3 +1,4 @@
+
 import torch
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -11,6 +12,68 @@ import sys
 # This allows users to put their .pt files in ComfyUI/models/yolo/
 if "yolo" not in folder_paths.folder_names_and_paths:
     folder_paths.folder_names_and_paths["yolo"] = ([os.path.join(folder_paths.models_dir, "yolo")], folder_paths.supported_pt_extensions)
+
+class BBoxStabilizer:
+    """边界框稳定器 - 使用多种算法减少检测框抖动"""
+    
+    def __init__(self, window_size=5):
+        self.history = []
+        self.window_size = window_size
+        
+    def smooth_ema(self, current, alpha=0.3):
+        """指数移动平均平滑"""
+        if not self.history:
+            return current
+        prev = self.history[-1]
+        return alpha * current + (1 - alpha) * prev
+    
+    def smooth_moving_average(self, current):
+        """移动平均平滑"""
+        self.history.append(current)
+        if len(self.history) > self.window_size:
+            self.history.pop(0)
+        return np.mean(self.history, axis=0)
+    
+    def smooth_dynamic(self, current, prev=None, threshold=10):
+        """动态平滑 - 根据移动幅度调整平滑强度"""
+        if prev is None:
+            if not self.history:
+                return current
+            prev = self.history[-1]
+        
+        movement = np.linalg.norm(current - prev)
+        
+        # 根据移动幅度动态调整alpha
+        if movement < threshold * 0.3:
+            alpha = 0.9  # 小幅移动 - 强平滑
+        elif movement < threshold * 0.6:
+            alpha = 0.6  # 中等移动 - 中等平滑
+        else:
+            alpha = 0.3  # 大幅移动 - 快速响应
+        
+        return alpha * prev + (1 - alpha) * current
+    
+    def update(self, bbox, method='ema', alpha=0.3):
+        """更新并返回平滑后的边界框"""
+        if method == 'ema':
+            smoothed = self.smooth_ema(bbox, alpha)
+        elif method == 'moving_average':
+            smoothed = self.smooth_moving_average(bbox)
+        elif method == 'dynamic':
+            smoothed = self.smooth_dynamic(bbox)
+        else:
+            smoothed = bbox
+        
+        if method != 'moving_average':
+            self.history.append(smoothed)
+            if len(self.history) > self.window_size:
+                self.history.pop(0)
+        
+        return smoothed
+    
+    def reset(self):
+        """重置历史记录"""
+        self.history = []
 
 class YOLODetectionNode:
     def __init__(self):
@@ -33,18 +96,19 @@ class YOLODetectionNode:
                 "confidence_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "nms_threshold": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "output_mode": (["Merged Mask", "Individual Objects"],),
+                "show_preview": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "class_ids": ("STRING", {"default": "", "multiline": False, "placeholder": "e.g. 0, 2 (leave empty for all)"}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "INT", "INT", "INT", "INT")
-    RETURN_NAMES = ("preview_image", "mask", "x", "y", "width", "height", "x2", "y2")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "INT", "INT", "INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("image", "preview_with_boxes", "mask", "x", "y", "width", "height", "x2", "y2")
     FUNCTION = "detect"
     CATEGORY = "YOLO"
 
-    def detect(self, image, model_name, select_criteria, select_count, confidence_threshold, nms_threshold, output_mode, class_ids=""):
+    def detect(self, image, model_name, select_criteria, select_count, confidence_threshold, nms_threshold, output_mode, show_preview, class_ids=""):
         # Load Model
         model_path = folder_paths.get_full_path("yolo", model_name)
         if model_path is None:
@@ -66,6 +130,7 @@ class YOLODetectionNode:
 
         # Prepare outputs
         out_images = []
+        out_preview_images = []
         out_masks = []
         out_x = []
         out_y = []
@@ -139,18 +204,22 @@ class YOLODetectionNode:
             h_img, w_img = img_np.shape[:2]
             
             if output_mode == "Merged Mask":
-                # 1. Preview Image (Original with boxes)
-                preview_np = img_np.copy()
-                # Draw boxes
-                for det in selected:
-                    x1, y1, x2, y2 = map(int, det["box"])
-                    cv2.rectangle(preview_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label = f"{self.model.names[det['cls']]} {det['conf']:.2f}"
-                    cv2.putText(preview_np, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # 1. Original Image
+                out_images.append(torch.from_numpy(img_np.astype(np.float32) / 255.0))
                 
-                out_images.append(torch.from_numpy(preview_np.astype(np.float32) / 255.0))
+                # 2. Preview Image with boxes
+                if show_preview:
+                    preview_np = img_np.copy()
+                    for det in selected:
+                        x1, y1, x2, y2 = map(int, det["box"])
+                        cv2.rectangle(preview_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        label = f"{self.model.names[det['cls']]} {det['conf']:.2f}"
+                        cv2.putText(preview_np, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    out_preview_images.append(torch.from_numpy(preview_np.astype(np.float32) / 255.0))
+                else:
+                    out_preview_images.append(torch.from_numpy(img_np.astype(np.float32) / 255.0))
 
-                # 2. Mask (Merged)
+                # 3. Mask (Merged)
                 mask = np.zeros((h_img, w_img), dtype=np.float32)
                 union_box = [w_img, h_img, 0, 0] # x1, y1, x2, y2 (inverted init)
                 has_valid_box = False
@@ -172,7 +241,7 @@ class YOLODetectionNode:
                 
                 out_masks.append(torch.from_numpy(mask))
 
-                # 3. Box Coords (Union of all selected)
+                # 4. Box Coords (Union of all selected)
                 if has_valid_box:
                     ux1, uy1, ux2, uy2 = union_box
                     out_x.append(ux1)
@@ -198,21 +267,28 @@ class YOLODetectionNode:
                 if not selected:
                     # Fallback: Output original image and empty mask
                     out_images.append(torch.from_numpy(img_np.astype(np.float32) / 255.0))
+                    out_preview_images.append(torch.from_numpy(img_np.astype(np.float32) / 255.0))
                     out_masks.append(torch.zeros((h_img, w_img), dtype=np.float32))
                     out_x.append(0); out_y.append(0); out_w.append(0); out_h.append(0); out_x2.append(0); out_y2.append(0)
                 else:
                     for det in selected:
-                        # Preview: Image with THIS box
-                        preview_np = img_np.copy()
-                        x1, y1, x2, y2 = map(int, det["box"])
-                        cv2.rectangle(preview_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        label = f"{self.model.names[det['cls']]} {det['conf']:.2f}"
-                        cv2.putText(preview_np, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        # Original image
+                        out_images.append(torch.from_numpy(img_np.astype(np.float32) / 255.0))
                         
-                        out_images.append(torch.from_numpy(preview_np.astype(np.float32) / 255.0))
+                        # Preview with box
+                        if show_preview:
+                            preview_np = img_np.copy()
+                            x1, y1, x2, y2 = map(int, det["box"])
+                            cv2.rectangle(preview_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            label = f"{self.model.names[det['cls']]} {det['conf']:.2f}"
+                            cv2.putText(preview_np, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                            out_preview_images.append(torch.from_numpy(preview_np.astype(np.float32) / 255.0))
+                        else:
+                            out_preview_images.append(torch.from_numpy(img_np.astype(np.float32) / 255.0))
                         
                         # Mask: Only this object
                         mask = np.zeros((h_img, w_img), dtype=np.float32)
+                        x1, y1, x2, y2 = map(int, det["box"])
                         # Ensure bounds
                         x1, y1 = max(0, x1), max(0, y1)
                         x2, y2 = min(w_img, x2), min(h_img, y2)
@@ -230,25 +306,19 @@ class YOLODetectionNode:
         # Stack outputs
         if not out_images:
             # Should not happen if input batch > 0
-            return (torch.zeros((1, 512, 512, 3)), torch.zeros((1, 512, 512)), 0, 0, 0, 0, 0, 0)
+            return (torch.zeros((1, 512, 512, 3)), torch.zeros((1, 512, 512, 3)), torch.zeros((1, 512, 512)), 0, 0, 0, 0, 0, 0)
 
         result_images = torch.stack(out_images)
+        result_preview_images = torch.stack(out_preview_images)
         result_masks = torch.stack(out_masks)
         
-        # For INT outputs, ComfyUI expects list of ints or single int?
-        # If we return a list, it might be interpreted as a batch of INTs if the node is set up right,
-        # but standard nodes usually return single values.
-        # However, custom nodes can return lists.
-        # To be safe for batch processing, we usually return a list if the input was a batch.
-        # But here we might have changed the batch size (Individual mode).
-        # Let's return lists. ComfyUI handles lists in outputs often by auto-batching or passing list.
-        
-        return (result_images, result_masks, out_x, out_y, out_w, out_h, out_x2, out_y2)
+        return (result_images, result_preview_images, result_masks, out_x, out_y, out_w, out_h, out_x2, out_y2)
 
 class YOLOTrackingNode:
     def __init__(self):
         self.model = None
         self.current_model_name = None
+        self.stabilizers = []  # 为每个跟踪对象创建独立的稳定器
 
     @classmethod
     def INPUT_TYPES(s):
@@ -268,7 +338,8 @@ class YOLOTrackingNode:
                 "crop_scale": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 5.0, "step": 0.01}),
                 "offset_x": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
                 "offset_y": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
-                "smoothing": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.99, "step": 0.01}),
+                "stabilization_method": (["None", "EMA", "Moving Average", "Dynamic"],),
+                "stabilization_strength": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 0.99, "step": 0.01}),
                 "mask_type": (["Box", "Segmentation"],),
             },
             "optional": {
@@ -281,7 +352,7 @@ class YOLOTrackingNode:
     FUNCTION = "track_and_crop"
     CATEGORY = "YOLO"
 
-    def track_and_crop(self, image, model_name, select_criteria, select_count, confidence_threshold, nms_threshold, crop_ratio, crop_scale, offset_x, offset_y, smoothing, mask_type, class_ids=""):
+    def track_and_crop(self, image, model_name, select_criteria, select_count, confidence_threshold, nms_threshold, crop_ratio, crop_scale, offset_x, offset_y, stabilization_method, stabilization_strength, mask_type, class_ids=""):
         # Load Model
         model_path = folder_paths.get_full_path("yolo", model_name)
         if model_path is None:
@@ -291,6 +362,13 @@ class YOLOTrackingNode:
             print(f"Loading YOLO model: {model_path}")
             self.model = YOLO(model_path)
             self.current_model_name = model_path
+            # 重置稳定器
+            self.stabilizers = []
+
+        # 初始化稳定器
+        if len(self.stabilizers) < select_count:
+            for _ in range(select_count - len(self.stabilizers)):
+                self.stabilizers.append(BBoxStabilizer(window_size=5))
 
         # Parse Class IDs
         target_classes = None
@@ -404,11 +482,20 @@ class YOLOTrackingNode:
                 ty2 = center_y + th / 2
                 target_box = np.array([tx1, ty1, tx2, ty2])
 
-                # Smooth
+                # 应用稳定化算法
+                if stabilization_method != "None" and det is not None:
+                    if stabilization_method == "EMA":
+                        target_box = self.stabilizers[i].update(target_box, method='ema', alpha=1.0-stabilization_strength)
+                    elif stabilization_method == "Moving Average":
+                        target_box = self.stabilizers[i].update(target_box, method='moving_average')
+                    elif stabilization_method == "Dynamic":
+                        target_box = self.stabilizers[i].update(target_box, method='dynamic')
+
+                # 更新当前框
                 if current_boxes[i] is None:
                     current_boxes[i] = target_box
                 else:
-                    current_boxes[i] = current_boxes[i] * smoothing + target_box * (1.0 - smoothing)
+                    current_boxes[i] = target_box
 
                 # Fix crop size for batch consistency
                 if fixed_cw is None:
@@ -507,3 +594,13 @@ class YOLOTrackingNode:
              return (torch.zeros((1, 512, 512, 3)), torch.zeros((1, 512, 512)))
 
         return (torch.stack(out_images), torch.stack(out_masks))
+
+NODE_CLASS_MAPPINGS = {
+    "YOLODetectionNode": YOLODetectionNode,
+    "YOLOTrackingNode": YOLOTrackingNode
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "YOLODetectionNode": "YOLO Detection",
+    "YOLOTrackingNode": "YOLO Tracking & Crop"
+}
